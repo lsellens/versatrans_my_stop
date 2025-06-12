@@ -1,12 +1,15 @@
 """vst_mystop.py - A script to track school bus locations using the My Stop API."""
 
+import logging
 import math
 import os
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any
 
 import requests
+
 
 CONFIG_FILE = "vst_mystop.conf"
 SCHOOL_LIST_URL = "https://mystopclientlistapi.azurewebsites.net/"
@@ -29,11 +32,11 @@ class ConfigManager:
 
     def __init__(self, config_file: str) -> None:
         self.config_file: str = config_file
-        self.config: dict = self.load_config()
+        self.config: dict[str, str | None] = self.load_config()
 
     def load_config(self) -> dict[str, str | None]:
         """Load configuration from the .conf file."""
-        config = {}
+        config: dict[str, str | None] = {}
         if os.path.exists(self.config_file):
             with open(self.config_file, "r", encoding="utf-8") as file:
                 for line in file:
@@ -115,14 +118,17 @@ class SchoolService:
         url = f"{SCHOOL_LIST_URL}api/ClientList/getall"
         headers = _common_headers()
         headers["Host"] = SCHOOL_LIST_URL.split("/")[2]
-        headers["Host"] = SCHOOL_LIST_URL.split("/")[2]
 
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code == 200:
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
             data = response.json()
-            return data.get("Clients", [])
-        else:
-            print(f"Failed to get school list. Status code: {response.status_code}")
+            if "Clients" in data:
+                return data["Clients"]
+            logging.error("API response missing 'Clients' key.")
+            return []
+        except requests.RequestException as e:
+            logging.error("Failed to get school list: %s", e)
             return []
 
     def get_closest_school_list(
@@ -131,7 +137,6 @@ class SchoolService:
         """Fetch the list of closest schools from the API based on coordinates."""
         url = f"{SCHOOL_LIST_URL}api/ClientList/getclosest"
         headers = _common_headers()
-        headers["Host"] = SCHOOL_LIST_URL.split("/")[2]
         headers["Host"] = SCHOOL_LIST_URL.split("/")[2]
 
         payload = {
@@ -145,18 +150,17 @@ class SchoolService:
         if response.status_code == 200:
             data = response.json()
             return data.get("Clients", [])
-        else:
-            print(
-                f"Failed to get closest school list. Status code: {response.status_code}"
-            )
-            return []
+        logging.error(
+            "Failed to get closest school list. Status code: %s", response.status_code
+        )
+        return []
 
     @staticmethod
     def select_school(school_list: list[dict]) -> dict[str, str] | None:
         """Allow the user to select a school from the list."""
         if not school_list:
-            print("No schools found.")
-            return {}
+            logging.warning("No schools found.")
+            return None
 
         print("Please select your school:")
         for i, school in enumerate(school_list):
@@ -175,26 +179,44 @@ class SchoolService:
                         "SchoolLatitude": selected_school["Latitude"],
                         "SchoolLongitude": selected_school["Longitude"],
                     }
-                else:
-                    print("Invalid choice. Try again.")
+                logging.warning("Invalid choice. Try again.")
             except ValueError:
-                print("Please enter a valid number.")
+                logging.warning("Please enter a valid number.")
+
+
+@dataclass
+class SessionInfo:
+    """Data class to hold session information."""
+
+    session_id: str | None = None
+    login_guid: str | None = None
+    record_id: str | None = None
+
+
+@dataclass
+class BusInfo:
+    """Data class to hold bus information."""
+
+    bus_id: str | None = None
+    route_number: str | None = None
+    stop_latitude: float | None = None
+    stop_longitude: float | None = None
 
 
 class BusTracker:
     """Handles login, session management, and bus tracking."""
 
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: dict[str, str | None]) -> None:
         """Initializes a new BusTracker instance."""
         self.config: dict = config
         self.session: requests.Session = requests.Session()
-        self.session_id: str | None = None
-        self.record_id: str | None = None
-        self.bus_id: str | None = None
-        self.stop_latitude: float | None = None
-        self.stop_longitude: float | None = None
-        self.login_guid: str | None = None
-        self.route_number: str | None = None
+        self.session_info = SessionInfo()
+        self.bus_info = BusInfo()
+
+    def _handle_api_error(self, message: str, exception: Exception) -> None:
+        """Log API error and reset bus ID."""
+        logging.error(f"{message}: %s", exception)
+        self.bus_info.bus_id = None
 
     def login_user(self) -> tuple[float | None, float | None, str | None, str | None]:
         """Log in to the service and return session details."""
@@ -212,44 +234,51 @@ class BusTracker:
         }
 
         # Send login request
-        response = self.session.post(url, json=payload, headers=headers)
-        if response.status_code == 200:
+        try:
+            response = self.session.post(url, json=payload, headers=headers, timeout=10)
+            response.raise_for_status()
             data = response.json()
 
-            # Check if bus is running and extract details
-            matched_bus_data = data["Students"][0].get("MatchedBusData", {})
-
-            if matched_bus_data:
-                isactive = matched_bus_data.get("IsActive", False)
-            else:
-                isactive = False
-
-            if not isactive:
-                self.bus_id = None
+            # API response validation
+            if "Students" not in data or not data["Students"]:
+                logging.error("API response missing 'Students' or empty.")
+                self.bus_info.bus_id = None
                 return None, None, None, None
 
-            self.session_id = data.get("SessionID", None)
-            self.login_guid = data.get("LoginGUID", None)
-            self.record_id = data["Students"][0].get("RecordID", None)
-            self.bus_id = data["Students"][0]["MatchedBusData"].get("RPVehicleId", None)
-            self.route_number = data["Students"][0]["MatchedRoute"].get("Route", None)
-            self.stop_latitude = data["Students"][0]["MatchedRoute"].get(
-                "StopLatitude", None
-            )
-            self.stop_longitude = data["Students"][0]["MatchedRoute"].get(
-                "StopLongitude", None
-            )
+            # Check if bus is running and extract details
+            matched_bus_data = data["Students"][0].get("MatchedBusData")
+            if not matched_bus_data:
+                logging.error("API response missing 'MatchedBusData' or it is None.")
+                self.bus_info.bus_id = None
+                return None, None, None, None
+
+            isactive = matched_bus_data.get("IsActive", False)
+
+            if not isactive:
+                self.bus_info.bus_id = None
+                return None, None, None, None
+
+            self.session_info.session_id = data.get("SessionID", None)
+            self.session_info.login_guid = data.get("LoginGUID", None)
+            self.session_info.record_id = data["Students"][0].get("RecordID", None)
+            self.bus_info.bus_id = matched_bus_data.get("RPVehicleId", None)
+            matched_route = data["Students"][0].get("MatchedRoute", {})
+            self.bus_info.route_number = matched_route.get("Route", None)
+            self.bus_info.stop_latitude = matched_route.get("StopLatitude", None)
+            self.bus_info.stop_longitude = matched_route.get("StopLongitude", None)
 
             # Bus current location
-            latitude = data["Students"][0]["MatchedBusData"].get("Latitude", None)
-            longitude = data["Students"][0]["MatchedBusData"].get("Longitude", None)
-            heading = data["Students"][0]["MatchedBusData"].get("Heading", None)
-            logtime = data["Students"][0]["MatchedBusData"].get("LogTime", None)
+            latitude = matched_bus_data.get("Latitude", None)
+            longitude = matched_bus_data.get("Longitude", None)
+            heading = matched_bus_data.get("Heading", None)
+            logtime = matched_bus_data.get("LogTime", None)
 
             return latitude, longitude, heading, logtime
-        else:
-            print(f"Login failed with status code {response.status_code}")
-            self.bus_id = None
+        except requests.RequestException as e:
+            self._handle_api_error("Login failed", e)
+            return None, None, None, None
+        except (KeyError, TypeError) as e:
+            self._handle_api_error("Unexpected error during login", e)
             return None, None, None, None
 
     def vehicledata(self) -> tuple[float | None, float | None, str | None, str | None]:
@@ -258,10 +287,10 @@ class BusTracker:
         url = f"{self.config['ServiceUrl']}api/student/vehicledata"
         headers = _common_headers()
         headers["Host"] = self.config["ServiceUrl"].split("/")[2]
-        if self.session_id is not None:
-            headers["X-SID"] = self.session_id
+        if self.session_info.session_id is not None:
+            headers["X-SID"] = self.session_info.session_id
 
-        payload = {"VehicleId": self.bus_id}
+        payload = {"VehicleId": self.bus_info.bus_id}
 
         response = self.session.post(url, json=payload, headers=headers)
 
@@ -272,7 +301,7 @@ class BusTracker:
             isactive = data["StuBusData"].get("IsActive", False)
 
             if not isactive:
-                self.bus_id = None
+                self.bus_info.bus_id = None
                 return None, None, None, None
 
             # Extract the relevant fields
@@ -281,21 +310,21 @@ class BusTracker:
             heading = data["StuBusData"].get("Heading", None)
             logtime = data["StuBusData"].get("LogTime", None)
             return latitude, longitude, heading, logtime
-        else:
-            print(f"Failed to fetch vehicle data. Status code: {response.status_code}")
-            self.bus_id = None
-            return None, None, None, None
+        logging.error(
+            "Failed to fetch vehicle data. Status code: %s", response.status_code
+        )
+        self.bus_info.bus_id = None
+        return None, None, None, None
 
-    def recentvehicledata(
-        self,
-    ) -> tuple[float | None, float | None, str | None, str | None]:
-        """Fetch the latest vehicle data for the bus."""
+    def recentvehicledata(self,) -> tuple[float | None, float | None, str | None, str | None]:
+        """Fetch recent vehicle data for the bus."""
 
-        url = f"{self.config['ServiceUrl']}api/student/recentvehicledata?rpVehicleId={self.bus_id}"
+        url = f"{self.config['ServiceUrl']}api/student/recentvehicledata?rpVehicleId={
+            self.bus_info.bus_id}"
         headers = _common_headers()
         headers["Host"] = self.config["ServiceUrl"].split("/")[2]
-        if self.session_id is not None:
-            headers["X-SID"] = self.session_id
+        if self.session_info.session_id is not None:
+            headers["X-SID"] = self.session_info.session_id
 
         response = self.session.post(url, headers=headers, data="null")
 
@@ -312,78 +341,69 @@ class BusTracker:
                 heading = direction
                 logtime = bus_info.get("LogTime", None)
                 return latitude, longitude, heading, logtime
-            else:
-                print("No valid bus data available.")
-                self.bus_id = None
-                return None, None, None, None
-        else:
-            print(f"Failed to fetch vehicle data. Status code: {response.status_code}")
-            self.bus_id = None
+            logging.error("No valid bus data available.")
+            self.bus_info.bus_id = None
             return None, None, None, None
+        logging.error(
+            "Failed to fetch vehicle data. Status code: %s", response.status_code
+        )
+        self.bus_info.bus_id = None
+        return None, None, None, None
+
+    def check_bus_status(
+        self,
+    ) -> tuple[float | None, float | None, str | None, str | None]:
+        """Helper function to check bus status and re-login if necessary."""
+        latitude, longitude, heading, logtime = self.login_user()
+        while not self.bus_info.bus_id or latitude is None or longitude is None:
+            logging.warning("Bus is not currently running.")
+            time.sleep(300)
+            latitude, longitude, heading, logtime = self.login_user()
+        return latitude, longitude, heading, logtime
 
     def track_bus(self, target_distance_meters: float) -> None:
         """Main loop to check the bus location and status."""
 
-        # Initial login and data retrieval
-        latitude, longitude, heading, logtime = self.login_user()
+        latitude, longitude, heading, logtime = self.check_bus_status()
 
-        # Check if bus is running and wait if not
-        while not self.bus_id or latitude is None or longitude is None:
-            print("Bus is not currently running.")
-            time.sleep(300)
-            latitude, longitude, heading, logtime = self.login_user()
-
-        # Track bus using initial data
-        if self.stop_latitude is not None and self.stop_longitude is not None:
-            distance_to_target = GeoUtils.haversine_distance(
-                latitude, longitude, self.stop_latitude, self.stop_longitude
-            )
-            print(f"Distance to target: {distance_to_target}")
-        else:
-            print(
-                "Stop latitude or longitude is not set. Cannot calculate distance to target."
-            )
-            distance_to_target = None
-        print(
-            f"Latitude: {latitude}, Longitude: {longitude}, Direction: {heading}, LogTime: {logtime}"
-        )
-        time.sleep(33)
-
+        # Continuously track bus until it reaches the target
         while True:
-            latitude, longitude, heading, logtime = self.vehicledata()
-            # Check for bus inactivity and re-login if necessary
-            while not self.bus_id or latitude is None or longitude is None:
-                print("Bus is not currently running.")
-                time.sleep(300)
-                latitude, longitude, heading, logtime = self.login_user()
-            if self.stop_latitude is not None and self.stop_longitude is not None:
+            if (
+                self.bus_info.stop_latitude is not None
+                and self.bus_info.stop_longitude is not None
+                and latitude is not None
+                and longitude is not None
+            ):
                 distance_to_target = GeoUtils.haversine_distance(
-                    latitude, longitude, self.stop_latitude, self.stop_longitude
+                    latitude,
+                    longitude,
+                    self.bus_info.stop_latitude,
+                    self.bus_info.stop_longitude,
                 )
                 print(f"Distance to target: {distance_to_target}")
             else:
-                print(
-                    "Stop latitude or longitude is not set. Cannot calculate distance to target."
+                logging.warning(
+                    "Stop latitude or longitude is not set, or bus location is unknown." \
+                    "Cannot calculate distance to target."
                 )
                 distance_to_target = None
 
             print(
-                f"Latitude: {latitude}, Longitude: {longitude}, Direction: {heading}, LogTime: {logtime}"
+                f"Latitude: {latitude}, Longitude: {longitude}, "
+                f"Direction: {heading}, LogTime: {logtime}"
             )
+
             if (
                 distance_to_target is not None
                 and distance_to_target < target_distance_meters
             ):
                 print("Bus is at bus stop.")
-                # break
+                break
+
             time.sleep(33)
-            if (
-                distance_to_target is not None
-                and distance_to_target < target_distance_meters
-            ):
-                print("Bus is at bus stop.")
-                # break
-            time.sleep(33)
+
+            # Update bus location data
+            latitude, longitude, heading, logtime = self.vehicledata()
 
     def student_scans(self) -> list[dict[str, Any]]:
         """Fetch student scans for the current record."""
@@ -391,10 +411,10 @@ class BusTracker:
         url = f"{self.config['ServiceUrl']}api/student/studentscans"
         headers = _common_headers()
         headers["Host"] = self.config["ServiceUrl"].split("/")[2]
-        if self.session_id is not None:
-            headers["X-SID"] = self.session_id
+        if self.session_info.session_id is not None:
+            headers["X-SID"] = self.session_info.session_id
 
-        payload = {"StuRecordList": [{"RecordID": self.record_id}]}
+        payload = {"StuRecordList": [{"RecordID": self.session_info.record_id}]}
 
         # Send login request
         response = self.session.post(url, json=payload, headers=headers)
@@ -405,54 +425,66 @@ class BusTracker:
                 return scans
             except (KeyError, TypeError, IndexError):
                 # Handle potential missing keys gracefully
-                print("Error accessing scan data. Returning empty list.")
+                logging.warning("Error accessing scan data. Returning empty list.")
                 return []
         else:
-            print(f"Failed to fetch student scans. Status code: {response.status_code}")
+            logging.error(
+                "Failed to fetch student scans. Status code: %s", response.status_code
+            )
             return []
 
 
 def main() -> None:
     """Main function to run the bus tracking script."""
-    # Load or initialize config
-    config_manager = ConfigManager(CONFIG_FILE)
+    try:
+        # Setup logging
+        logging.basicConfig(
+            level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
+        )
 
-    # Prompt for username and password if not already configured
-    config_manager.prompt_for_credentials()
+        # Load or initialize config
+        config_manager = ConfigManager(CONFIG_FILE)
 
-    # Generate a random device ID and store it
-    if not config_manager.config.get("DeviceID"):
-        config_manager.config["DeviceID"] = str(uuid.uuid4())
+        # Prompt for username and password if not already configured
+        config_manager.prompt_for_credentials()
 
-    # Initialize bus tracker
-    bus_tracker = BusTracker(config_manager.get_config())
+        # Generate a random device ID and store it
+        if not config_manager.config.get("DeviceID"):
+            config_manager.config["DeviceID"] = str(uuid.uuid4())
 
-    # Check if 'SchoolGUID' and 'ServiceUrl' are already in the config
-    if (
-        "SchoolGUID" not in config_manager.config
-        or "ServiceUrl" not in config_manager.config
-        or "SchoolLatitude" not in config_manager.config
-        or "SchoolLongitude" not in config_manager.config
-    ):
-        # Fetch school list and allow user to select a school
-        school_list = SchoolService.get_all_school_list()
-        if not school_list:
-            print("Failed to retrieve school list.")
-            return
+        # Initialize bus tracker
+        bus_tracker = BusTracker(config_manager.get_config())
 
-        school_info = SchoolService.select_school(school_list)
-        if not school_info:
-            print("No school selected. Exiting.")
-            return
+        # Check if 'SchoolGUID' and 'ServiceUrl' are already in the config
+        if (
+            "SchoolGUID" not in config_manager.config
+            or "ServiceUrl" not in config_manager.config
+            or "SchoolLatitude" not in config_manager.config
+            or "SchoolLongitude" not in config_manager.config
+        ):
+            # Fetch school list and allow user to select a school
+            school_list = SchoolService.get_all_school_list()
+            if not school_list:
+                logging.error("Failed to retrieve school list.")
+                return
 
-        # Update configuration with selected school details
-        config_manager.config.update(school_info)
+            school_info = SchoolService.select_school(school_list)
+            if not school_info:
+                logging.error("No school selected. Exiting.")
+                return
 
-    # Save updated config to file
-    config_manager.save_config()
+            # Update configuration with selected school details
+            config_manager.config.update(school_info)
 
-    # Log in and start tracking
-    bus_tracker.track_bus(target_distance_meters=TARGET_DISTANCE_METERS)
+        # Save updated config to file
+        config_manager.save_config()
+
+        # Log in and start tracking
+        bus_tracker.track_bus(target_distance_meters=TARGET_DISTANCE_METERS)
+    except KeyboardInterrupt:
+        logging.info("Exiting on user request (KeyboardInterrupt).")
+    except (ValueError, TypeError, requests.RequestException) as e:
+        logging.error("Fatal error: %s", e)
 
 
 if __name__ == "__main__":
