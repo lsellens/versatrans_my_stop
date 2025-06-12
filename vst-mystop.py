@@ -1,11 +1,14 @@
+"""vst_mystop.py - A script to track school bus locations using the My Stop API."""
+
 import math
 import os
 import time
 import uuid
+from typing import Any
 
 import requests
 
-CONFIG_FILE = "vst-mystop.conf"
+CONFIG_FILE = "vst_mystop.conf"
 SCHOOL_LIST_URL = "https://mystopclientlistapi.azurewebsites.net/"
 TARGET_DISTANCE_METERS = 82
 
@@ -32,7 +35,7 @@ class ConfigManager:
         """Load configuration from the .conf file."""
         config = {}
         if os.path.exists(self.config_file):
-            with open(self.config_file, "r") as file:
+            with open(self.config_file, "r", encoding="utf-8") as file:
                 for line in file:
                     if "=" in line:
                         key, value = line.strip().split("=", 1)
@@ -41,7 +44,7 @@ class ConfigManager:
 
     def save_config(self) -> None:
         """Save configuration to the .conf file."""
-        with open(self.config_file, "w") as file:
+        with open(self.config_file, "w", encoding="utf-8") as file:
             for key, value in self.config.items():
                 file.write(f"{key}={value if value else ''}\n")
 
@@ -63,7 +66,7 @@ class GeoUtils:
     @staticmethod
     def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
         """Calculate the Haversine distance between two GPS coordinates."""
-        R = 6371000  # Radius of Earth in meters
+        r = 6371000  # Radius of Earth in meters
         phi1 = math.radians(lat1)
         phi2 = math.radians(lat2)
         delta_phi = math.radians(lat2 - lat1)
@@ -75,14 +78,29 @@ class GeoUtils:
         )
         c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
-        return R * c
+        return r * c
 
     @staticmethod
     def degrees_to_direction(degrees: float) -> str:
         """Convert degrees to cardinal direction."""
         directions = [
-            "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
-            "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW", "N"
+            "N",
+            "NNE",
+            "NE",
+            "ENE",
+            "E",
+            "ESE",
+            "SE",
+            "SSE",
+            "S",
+            "SSW",
+            "SW",
+            "WSW",
+            "W",
+            "WNW",
+            "NW",
+            "NNW",
+            "N",
         ]
         index = int((degrees + 11.25) % 360 / 22.5)
         return directions[index]
@@ -92,13 +110,14 @@ class SchoolService:
     """Handles API interactions to fetch school data."""
 
     @staticmethod
-    def get_all_school_list() -> list[dict[str, any]]:
+    def get_all_school_list() -> list[dict[str, Any]]:
         """Fetch the list of schools from the API."""
         url = f"{SCHOOL_LIST_URL}api/ClientList/getall"
         headers = _common_headers()
         headers["Host"] = SCHOOL_LIST_URL.split("/")[2]
+        headers["Host"] = SCHOOL_LIST_URL.split("/")[2]
 
-        response = requests.get(url, headers=headers)
+        response = requests.get(url, headers=headers, timeout=10)
         if response.status_code == 200:
             data = response.json()
             return data.get("Clients", [])
@@ -106,13 +125,13 @@ class SchoolService:
             print(f"Failed to get school list. Status code: {response.status_code}")
             return []
 
-    @staticmethod
     def get_closest_school_list(
-        lat: float, lon: float, distance: float
-    ) -> list[dict[str, any]]:
+        self, lat: float, lon: float, distance: float
+    ) -> list[dict[str, Any]]:
         """Fetch the list of closest schools from the API based on coordinates."""
         url = f"{SCHOOL_LIST_URL}api/ClientList/getclosest"
         headers = _common_headers()
+        headers["Host"] = SCHOOL_LIST_URL.split("/")[2]
         headers["Host"] = SCHOOL_LIST_URL.split("/")[2]
 
         payload = {
@@ -122,7 +141,7 @@ class SchoolService:
             "Distance": distance,
         }
 
-        response = requests.post(url, json=payload, headers=headers)
+        response = requests.post(url, json=payload, headers=headers, timeout=10)
         if response.status_code == 200:
             data = response.json()
             return data.get("Clients", [])
@@ -205,7 +224,6 @@ class BusTracker:
             else:
                 isactive = False
 
-
             if not isactive:
                 self.bus_id = None
                 return None, None, None, None
@@ -221,6 +239,7 @@ class BusTracker:
             self.stop_longitude = data["Students"][0]["MatchedRoute"].get(
                 "StopLongitude", None
             )
+
             # Bus current location
             latitude = data["Students"][0]["MatchedBusData"].get("Latitude", None)
             longitude = data["Students"][0]["MatchedBusData"].get("Longitude", None)
@@ -235,10 +254,12 @@ class BusTracker:
 
     def vehicledata(self) -> tuple[float | None, float | None, str | None, str | None]:
         """Fetch the latest vehicle data for the bus."""
+
         url = f"{self.config['ServiceUrl']}api/student/vehicledata"
         headers = _common_headers()
         headers["Host"] = self.config["ServiceUrl"].split("/")[2]
-        headers["X-SID"] = self.session_id
+        if self.session_id is not None:
+            headers["X-SID"] = self.session_id
 
         payload = {"VehicleId": self.bus_id}
 
@@ -269,10 +290,12 @@ class BusTracker:
         self,
     ) -> tuple[float | None, float | None, str | None, str | None]:
         """Fetch the latest vehicle data for the bus."""
+
         url = f"{self.config['ServiceUrl']}api/student/recentvehicledata?rpVehicleId={self.bus_id}"
         headers = _common_headers()
         headers["Host"] = self.config["ServiceUrl"].split("/")[2]
-        headers["X-SID"] = self.session_id
+        if self.session_id is not None:
+            headers["X-SID"] = self.session_id
 
         response = self.session.post(url, headers=headers, data="null")
 
@@ -311,14 +334,21 @@ class BusTracker:
             latitude, longitude, heading, logtime = self.login_user()
 
         # Track bus using initial data
-        distance_to_target = GeoUtils.haversine_distance(
-            latitude, longitude, self.stop_latitude, self.stop_longitude
-        )
-        print(f"Distance to target: {distance_to_target}")
+        if self.stop_latitude is not None and self.stop_longitude is not None:
+            distance_to_target = GeoUtils.haversine_distance(
+                latitude, longitude, self.stop_latitude, self.stop_longitude
+            )
+            print(f"Distance to target: {distance_to_target}")
+        else:
+            print(
+                "Stop latitude or longitude is not set. Cannot calculate distance to target."
+            )
+            distance_to_target = None
         print(
             f"Latitude: {latitude}, Longitude: {longitude}, Direction: {heading}, LogTime: {logtime}"
         )
         time.sleep(33)
+
         while True:
             latitude, longitude, heading, logtime = self.vehicledata()
             # Check for bus inactivity and re-login if necessary
@@ -326,25 +356,43 @@ class BusTracker:
                 print("Bus is not currently running.")
                 time.sleep(300)
                 latitude, longitude, heading, logtime = self.login_user()
+            if self.stop_latitude is not None and self.stop_longitude is not None:
+                distance_to_target = GeoUtils.haversine_distance(
+                    latitude, longitude, self.stop_latitude, self.stop_longitude
+                )
+                print(f"Distance to target: {distance_to_target}")
+            else:
+                print(
+                    "Stop latitude or longitude is not set. Cannot calculate distance to target."
+                )
+                distance_to_target = None
 
-            distance_to_target = GeoUtils.haversine_distance(
-                latitude, longitude, self.stop_latitude, self.stop_longitude
-            )
-
-            print(f"Distance to target: {distance_to_target}")
             print(
                 f"Latitude: {latitude}, Longitude: {longitude}, Direction: {heading}, LogTime: {logtime}"
             )
-            if distance_to_target < target_distance_meters:
+            if (
+                distance_to_target is not None
+                and distance_to_target < target_distance_meters
+            ):
+                print("Bus is at bus stop.")
+                # break
+            time.sleep(33)
+            if (
+                distance_to_target is not None
+                and distance_to_target < target_distance_meters
+            ):
                 print("Bus is at bus stop.")
                 # break
             time.sleep(33)
 
-    def student_scans(self) -> list[dict[str, any]]:
+    def student_scans(self) -> list[dict[str, Any]]:
+        """Fetch student scans for the current record."""
+
         url = f"{self.config['ServiceUrl']}api/student/studentscans"
         headers = _common_headers()
         headers["Host"] = self.config["ServiceUrl"].split("/")[2]
-        headers["X-SID"] = self.session_id
+        if self.session_id is not None:
+            headers["X-SID"] = self.session_id
 
         payload = {"StuRecordList": [{"RecordID": self.record_id}]}
 
@@ -361,9 +409,11 @@ class BusTracker:
                 return []
         else:
             print(f"Failed to fetch student scans. Status code: {response.status_code}")
-            return None
+            return []
 
-def main():
+
+def main() -> None:
+    """Main function to run the bus tracking script."""
     # Load or initialize config
     config_manager = ConfigManager(CONFIG_FILE)
 
